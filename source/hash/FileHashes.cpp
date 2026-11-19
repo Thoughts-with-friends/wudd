@@ -5,6 +5,12 @@
 #include <utility>
 
 #include <cstring>
+#include <type_traits>
+
+static_assert(std::is_trivially_copyable_v<CRC32>);
+static_assert(std::is_trivially_copyable_v<MD5>);
+static_assert(std::is_trivially_copyable_v<SHA1>);
+static_assert(std::is_trivially_copyable_v<SHA256>);
 
 FileHashes::FileHashes() {
     reset();
@@ -90,4 +96,36 @@ std::map<FileHashes::HashType, std::string> FileHashes::getHashes() {
         result[HashType::SHA256] = mDigestSha2.getHash();
     }
     return result;
+}
+std::vector<uint8_t> FileHashes::exportState() const {
+    std::vector<uint8_t> out(sizeof(CRC32) + sizeof(MD5) + sizeof(SHA1) + sizeof(SHA256));
+    auto *ptr = out.data();
+    memcpy(ptr, &mDigestCrc32, sizeof(CRC32));
+    ptr += sizeof(CRC32);
+    memcpy(ptr, &mDigestMd5, sizeof(MD5));
+    ptr += sizeof(MD5);
+    memcpy(ptr, &mDigestSha1, sizeof(SHA1));
+    ptr += sizeof(SHA1);
+    memcpy(ptr, &mDigestSha2, sizeof(SHA256));
+    return out;
+}
+
+bool FileHashes::importState(const std::vector<uint8_t> &state) {
+    if (state.size() != sizeof(CRC32) + sizeof(MD5) + sizeof(SHA1) + sizeof(SHA256)) {
+        return false;
+    }
+    std::lock_guard lock(mQueueMutex);
+    if (!mHashQueue.empty()) {
+        return false;
+    }
+    const auto *ptr = state.data();
+    memcpy(&mDigestCrc32, ptr, sizeof(CRC32));
+    ptr += sizeof(CRC32);
+    memcpy(&mDigestMd5, ptr, sizeof(MD5));
+    ptr += sizeof(MD5);
+    memcpy(&mDigestSha1, ptr, sizeof(SHA1));
+    ptr += sizeof(SHA1);
+    memcpy(&mDigestSha2, ptr, sizeof(SHA256));
+    OSMemoryBarrier();
+    return true;
 }

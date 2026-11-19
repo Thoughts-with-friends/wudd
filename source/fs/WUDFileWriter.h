@@ -21,7 +21,7 @@
 
 class WUDFileWriter : public IWUDFileWriter, public WriteOnlyFileWithCache {
 public:
-    WUDFileWriter(const char *string, int32_t cacheSize, int32_t sectorSize, bool split = false);
+    WUDFileWriter(const char *string, int32_t cacheSize, int32_t sectorSize, bool split = false, int32_t startPart = 1);
     ~WUDFileWriter() override = default;
     int32_t writeSector(const uint8_t *sector_buf, size_t size) override;
 
@@ -30,6 +30,8 @@ public:
     [[nodiscard]] std::set<std::string> getPaths() const override;
 
     [[nodiscard]] bool isReady() const override;
+
+    [[nodiscard]] int32_t getNextPart() const override;
 
 protected:
     int32_t sectorSize;

@@ -22,6 +22,7 @@
 #include <WUD/content/WiiUDiscContentsHeader.h>
 #include <common/common.h>
 #include <fs/FSUtils.h>
+#include <cstdio>
 #include <malloc.h>
 #include <mocha/fsa.h>
 #include <mocha/mocha.h>
@@ -110,6 +111,7 @@ ApplicationState::eSubState WUDDumperState::update(Input *input) {
         if (FSAEx_RawReadEx(gFSAClientHandle, this->sectorBuf, READ_SECTOR_SIZE, 1, 0, this->oddFd) >= 0) {
             this->discId[10] = '\0';
             memcpy(this->discId.data(), sectorBuf, 10);
+            calculateHash256(static_cast<unsigned char *>(this->sectorBuf), READ_SECTOR_SIZE, this->firstSectorHash.data());
             this->state = STATE_READ_DISC_INFO_DONE;
             return ApplicationState::SUBSTATE_RUNNING;
         }
@@ -144,23 +146,81 @@ ApplicationState::eSubState WUDDumperState::update(Input *input) {
                 return SUBSTATE_RUNNING;
             }
         }
-        this->state = STATE_DUMP_DISC_START;
+        this->state = STATE_PLAN_DUMP;
+    } else if (this->state == STATE_PLAN_DUMP) {
+        this->totalSectorCount = (WUD_FILE_SIZE / SECTOR_SIZE);
+        this->useFoundCache    = false;
+        this->foundCache.reset();
+        if (targetFormat == DUMP_STUB) {
+            planRun(0);
+            this->state = STATE_DUMP_DISC_START;
+            return ApplicationState::SUBSTATE_RUNNING;
+        }
+        queryFreeSpace();
+        if (targetFormat == DUMP_AS_WUD) {
+            auto cache = ResumeCache::load(getResumeCachePath());
+            if (cache && cache->targetFormat == static_cast<uint32_t>(targetFormat) && cache->discId == getPathNameForDisc() &&
+                cache->firstSectorHash == this->firstSectorHash && cache->totalSectorCount == this->totalSectorCount) {
+                this->foundCache      = std::move(cache);
+                this->selectedOptionX = 0;
+                this->state           = STATE_ASK_USE_CACHE;
+                return ApplicationState::SUBSTATE_RUNNING;
+            }
+        }
+        if (!planRun(0)) {
+            setError(ERROR_NOT_ENOUGH_SPACE);
+            return ApplicationState::SUBSTATE_RUNNING;
+        }
+        this->state = STATE_CONFIRM_PLAN;
+    } else if (this->state == STATE_ASK_USE_CACHE) {
+        if (buttonPressed(input, Input::BUTTON_B)) {
+            return ApplicationState::SUBSTATE_RETURN;
+        }
+        proccessMenuNavigationX(input, 2);
+        if (entrySelected(input)) {
+            this->useFoundCache   = this->selectedOptionX == 0;
+            this->selectedOptionX = 0;
+            if (!planRun(this->useFoundCache ? this->foundCache->nextSector : 0)) {
+                setError(ERROR_NOT_ENOUGH_SPACE);
+                return ApplicationState::SUBSTATE_RUNNING;
+            }
+            if (this->useFoundCache) {
+                this->runStartPart = this->foundCache->nextPart;
+                this->runNumber    = this->foundCache->nextRun;
+            }
+            this->state = STATE_CONFIRM_PLAN;
+        }
+    } else if (this->state == STATE_CONFIRM_PLAN) {
+        if (buttonPressed(input, Input::BUTTON_B)) {
+            return ApplicationState::SUBSTATE_RETURN;
+        }
+        if (entrySelected(input)) {
+            this->state = STATE_DUMP_DISC_START;
+        }
     } else if (this->state == STATE_DUMP_DISC_START) {
         if (!FSUtils::CreateSubfolder(string_format("%swudump/%s", getPathForDevice(targetDevice).c_str(), getPathNameForDisc().c_str()).c_str())) {
             setError(ERROR_WRITE_FAILED);
             return ApplicationState::SUBSTATE_RUNNING;
         }
         this->skippedSectors.clear();
+        if (this->useFoundCache) {
+            this->skippedSectors = this->foundCache->skippedSectors;
+        }
         if (targetFormat == DUMP_AS_WUX) {
             this->fileHandle = std::make_unique<WUXFileWriter>(string_format("%swudump/%s/game.wux", getPathForDevice(targetDevice).c_str(), getPathNameForDisc().c_str()).c_str(), READ_SECTOR_SIZE * WRITE_BUFFER_NUM_SECTORS,
                                                                SECTOR_SIZE, targetDevice == TARGET_SD);
         } else if (targetFormat == DUMP_AS_WUD) {
             this->fileHandle = std::make_unique<WUDFileWriter>(string_format("%swudump/%s/game.wud", getPathForDevice(targetDevice).c_str(), getPathNameForDisc().c_str()).c_str(), READ_SECTOR_SIZE * WRITE_BUFFER_NUM_SECTORS,
-                                                               SECTOR_SIZE, targetDevice == TARGET_SD);
+                                                               SECTOR_SIZE, this->forceSplit, this->runStartPart);
         } else if (targetFormat == DUMP_STUB) {
             this->fileHandle = std::make_unique<StubWudFileWriter>();
         }
         wudFileHashes.reset();
+        this->hashesValid = true;
+        if (this->useFoundCache) {
+            // Continue the hashes of the previous runs.
+            this->hashesValid = wudFileHashes.importState(this->foundCache->hashState);
+        }
         if (!this->fileHandle->isReady()) {
             DEBUG_FUNCTION_LINE_ERR("File is not ready.");
             this->setError(ERROR_FILE_OPEN_FAILED);
@@ -168,9 +228,10 @@ ApplicationState::eSubState WUDDumperState::update(Input *input) {
         }
 
         this->state            = STATE_DUMP_DISC;
-        this->totalSectorCount = (WUD_FILE_SIZE / SECTOR_SIZE);
-        this->currentSector    = 0;
+        this->currentSector    = this->runStartSector;
         this->writtenSectors   = 0;
+        this->runStartTicks    = OSGetTime();
+        this->resumeCacheSaved = false;
         this->retryCount       = 10;
         this->logFileName      = "";
         this->logFileSaved     = false;
@@ -180,7 +241,7 @@ ApplicationState::eSubState WUDDumperState::update(Input *input) {
             return ApplicationState::SUBSTATE_RUNNING;
         }
 
-        size_t numSectors = this->currentSector + READ_NUM_SECTORS > this->totalSectorCount ? this->totalSectorCount - this->currentSector : READ_NUM_SECTORS;
+        size_t numSectors = this->currentSector + READ_NUM_SECTORS > this->runEndSector ? this->runEndSector - this->currentSector : READ_NUM_SECTORS;
         if ((this->readResult = FSAEx_RawReadEx(gFSAClientHandle, sectorBuf, READ_SECTOR_SIZE, numSectors, this->currentSector, this->oddFd)) >= 0) {
             auto curWrittenSectors = fileHandle->writeSector((const uint8_t *) this->sectorBuf, numSectors);
             if (curWrittenSectors < 0) {
@@ -192,14 +253,9 @@ ApplicationState::eSubState WUDDumperState::update(Input *input) {
             this->writtenSectors += curWrittenSectors;
 
             this->retryCount = 10;
-            if (this->currentSector >= this->totalSectorCount) {
-                this->state = STATE_DUMP_DISC_DONE_SAVING_REPORT;
-                if (!this->fileHandle->finalize()) {
-                    DEBUG_FUNCTION_LINE_ERR("Final flush failed");
-                    this->setError(ERROR_WRITE_FAILED);
-                    return ApplicationState::SUBSTATE_RUNNING;
-                }
-                this->wudFileHashes.finalize();
+            if (this->currentSector >= this->runEndSector) {
+                finishRun();
+                return ApplicationState::SUBSTATE_RUNNING;
             }
         } else {
             this->state = STATE_WAIT_USER_ERROR_CONFIRM;
@@ -255,6 +311,10 @@ ApplicationState::eSubState WUDDumperState::update(Input *input) {
             this->currentSector += 1;
             this->writtenSectors += curWrittenSectors;
             this->readResult = 0;
+            if (this->currentSector >= this->runEndSector) {
+                finishRun();
+                return ApplicationState::SUBSTATE_RUNNING;
+            }
         } else if (buttonPressed(input, Input::BUTTON_B)) {
             this->state      = STATE_OPEN_ODD1;
             this->readResult = 0;
@@ -272,10 +332,20 @@ ApplicationState::eSubState WUDDumperState::update(Input *input) {
         log.targetFormat    = this->targetFormat;
         log.wuddVersion     = VERSION_STR " " VERSION_EXTRA;
         const auto curTime  = OSGetTime();
-        const auto dumpTime = OSTicksToMilliseconds(curTime - dumpStartTicks);
+        const auto dumpTime = OSTicksToMilliseconds(curTime - runStartTicks);
         log.durationSeconds = static_cast<uint32_t>(dumpTime / 1000);
 
-        log.disc.hashes = this->wudFileHashes.getHashes();
+        if (this->hashesValid && !this->runIsPartial) {
+            log.disc.hashes = this->wudFileHashes.getHashes();
+        }
+        log.disc.partial = this->runIsPartial;
+        if (this->runIsPartial || this->runStartSector > 0) {
+            log.disc.runInfo = string_format("Run %d: bytes 0x%llX - 0x%llX of 0x%llX%s", this->runNumber,
+                                             static_cast<unsigned long long>(this->runStartSector * SECTOR_SIZE),
+                                             static_cast<unsigned long long>(this->currentSector * SECTOR_SIZE),
+                                             static_cast<unsigned long long>(this->totalSectorCount * SECTOR_SIZE),
+                                             this->runIsPartial ? " (resume cache saved)" : " (final run)");
+        }
 
         if (this->discId[0] != '\0') {
             log.disc.discIdOpt = std::string((char *) &discId[0]);
@@ -352,6 +422,51 @@ void WUDDumperState::render() {
         WiiUScreen::drawLine("Read disc information");
     } else if (this->state == STATE_READ_DISC_INFO_DONE) {
         WiiUScreen::drawLinef("%s: %s", modeStr(), getPathNameForDisc().c_str());
+    } else if (this->state == STATE_PLAN_DUMP) {
+        WiiUScreen::drawLine("Checking free space...");
+    } else if (this->state == STATE_ASK_USE_CACHE) {
+        WiiUScreen::drawLinef("%s: %s", modeStr(), getPathNameForDisc().c_str());
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("A resume cache for this disc was found:");
+        WiiUScreen::drawLinef(" Run %d, continue at %.2f MiB / %.2f MiB (part%02d)", this->foundCache->nextRun,
+                              this->foundCache->nextSector * (SECTOR_SIZE / 1024.0f / 1024.0f), WUD_FILE_SIZE / 1024.0f / 1024.0f, this->foundCache->nextPart);
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("Do you want to use the cache?");
+        WiiUScreen::drawLine();
+        if (selectedOptionX == 0) {
+            WiiUScreen::drawLine("> Yes (continue)     No (start from 0)");
+        } else {
+            WiiUScreen::drawLine("  Yes (continue)   > No (start from 0)");
+        }
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("Press B to return");
+    } else if (this->state == STATE_CONFIRM_PLAN) {
+        WiiUScreen::drawLinef("%s: %s", modeStr(), getPathNameForDisc().c_str());
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLinef("Dump size:  %10.2f MiB%s", getRunBytes() / 1024.0f / 1024.0f, targetFormat == DUMP_AS_WUX ? " (max, before compression)" : "");
+        if (freeSpaceKnown) {
+            WiiUScreen::drawLinef("Free space: %10.2f MiB (of %.2f MiB)", freeBytesAtStart / 1024.0f / 1024.0f, deviceTotalBytes / 1024.0f / 1024.0f);
+        } else {
+            WiiUScreen::drawLine("Free space: unknown");
+        }
+        WiiUScreen::drawLinef("Disc range: %.2f - %.2f MiB of %.2f MiB", this->runStartSector * (SECTOR_SIZE / 1024.0f / 1024.0f),
+                              this->runEndSector * (SECTOR_SIZE / 1024.0f / 1024.0f), WUD_FILE_SIZE / 1024.0f / 1024.0f);
+        WiiUScreen::drawLine();
+        if (this->runIsPartial) {
+            WiiUScreen::drawLinef("Not enough space for the whole disc. This is run %d.", this->runNumber);
+            WiiUScreen::drawLine("A resume cache will be saved to the drive when it ends.");
+        } else if (this->runStartSector > 0) {
+            WiiUScreen::drawLinef("Run %d: this is the final run.", this->runNumber);
+        }
+        if (this->forceSplit && targetFormat == DUMP_AS_WUD) {
+            WiiUScreen::drawLinef("Files: game.wud.part%02d, ...", this->runStartPart);
+        }
+        if (targetFormat == DUMP_AS_WUX && freeSpaceKnown && freeBytesAtStart < WUD_FILE_SIZE + FREE_SPACE_MARGIN) {
+            WiiUScreen::drawLine("Warning: the WUX may not fit and can not be split");
+            WiiUScreen::drawLine("over multiple drives. Use WUD mode in that case.");
+        }
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("Press A to start, B to return");
     } else if (this->state == STATE_DUMP_DISC_START || this->state == STATE_DUMP_DISC || this->state == STATE_WAIT_USER_ERROR_CONFIRM) {
         WiiUScreen::drawLinef("%s: %s", modeStr(), getPathNameForDisc().c_str());
 
@@ -360,6 +475,19 @@ void WUDDumperState::render() {
         if (targetFormat == DUMP_AS_WUX) {
             WiiUScreen::drawLinef("Written %0.2f MiB. Compression ratio 1:%0.2f", writtenSectors * (READ_SECTOR_SIZE / 1024.0f / 1024.0f),
                                   1.0f / (writtenSectors / (float) this->currentSector));
+        }
+        if (targetFormat != DUMP_STUB) {
+            const char *deviceName = targetDevice == TARGET_NTFS ? "USB" : "SD";
+            if (freeSpaceKnown) {
+                WiiUScreen::drawLinef("%s: %.2f MiB free / %.2f MiB total", deviceName, getLiveFreeBytes() / 1024.0f / 1024.0f, deviceTotalBytes / 1024.0f / 1024.0f);
+            } else {
+                WiiUScreen::drawLinef("%s: free space unknown", deviceName);
+            }
+        }
+        if (this->runIsPartial) {
+            WiiUScreen::drawLinef("Run %d stops at %.2f MiB -> resume cache will be saved", this->runNumber, this->runEndSector * (SECTOR_SIZE / 1024.0f / 1024.0f));
+        } else if (this->runStartSector > 0) {
+            WiiUScreen::drawLinef("Run %d (resumed at %.2f MiB), final run", this->runNumber, this->runStartSector * (SECTOR_SIZE / 1024.0f / 1024.0f));
         }
 
         if (this->readResult < 0 || this->oddFd < 0) {
@@ -376,14 +504,15 @@ void WUDDumperState::render() {
             WiiUScreen::drawLine("Press B to try again");
         } else {
             OSTime curTime       = OSGetTime();
-            float remaining      = (WUD_FILE_SIZE - (READ_SECTOR_SIZE * this->currentSector)) / 1024.0f / 1024.0f;
-            float curSpeed       = READ_SECTOR_SIZE * ((this->currentSector / 1000.0f) / OSTicksToMilliseconds(curTime - dumpStartTicks));
-            int32_t remainingSec = remaining / curSpeed;
+            float remaining      = (this->runEndSector - this->currentSector) * (READ_SECTOR_SIZE / 1024.0f / 1024.0f);
+            float elapsedSec     = OSTicksToMilliseconds(curTime - runStartTicks) / 1000.0f;
+            float curSpeed       = elapsedSec > 0 ? (this->currentSector - this->runStartSector) * (READ_SECTOR_SIZE / 1024.0f / 1024.0f) / elapsedSec : 0.0f;
+            int32_t remainingSec = curSpeed > 0 ? remaining / curSpeed : 0;
             int32_t minutes      = (remainingSec / 60) % 60;
             int32_t seconds      = remainingSec % 60;
             int32_t hours        = remainingSec / 3600;
 
-            WiiUScreen::drawLinef("Speed: %.2f MiB/s ETA: %02dh %02dm %02ds", curSpeed, remaining, hours, minutes, seconds);
+            WiiUScreen::drawLinef("Speed: %.2f MiB/s ETA: %02dh %02dm %02ds", curSpeed, hours, minutes, seconds);
         }
 
         WiiUScreen::drawLine();
@@ -405,6 +534,13 @@ void WUDDumperState::render() {
     } else if (this->state == STATE_DUMP_DISC_DONE) {
         if (targetFormat == DUMP_STUB) {
             WiiUScreen::drawLinef("Hashing done! Press A to continue.");
+        } else if (this->runIsPartial) {
+            WiiUScreen::drawLinef("Run %d done (%.2f MiB / %.2f MiB). Press A to continue", this->runNumber,
+                                  this->currentSector * (SECTOR_SIZE / 1024.0f / 1024.0f), WUD_FILE_SIZE / 1024.0f / 1024.0f);
+            WiiUScreen::drawLine();
+            WiiUScreen::drawLinef("Resume cache saved. Files: game.wud.part%02d - part%02d", this->runStartPart, this->fileHandle->getNextPart() - 1);
+            WiiUScreen::drawLine("PC: move /wudump into a new folder per run (1, 2, ...).");
+            WiiUScreen::drawLine("Keep /dumpling on the USB, then select \"Dump as WUD\" again.");
         } else {
             WiiUScreen::drawLinef("Dumping done! Press A to continue");
         }
@@ -417,8 +553,17 @@ void WUDDumperState::render() {
             WiiUScreen::drawLine();
         }
 
-        WiiUScreen::drawLinef("Hashes of uncompressed wud:");
-        for (const auto &[fst, snd] : this->wudFileHashes.getHashes()) {
+        if (this->runIsPartial) {
+            ApplicationState::printFooter();
+            WiiUScreen::flipBuffers();
+            return;
+        }
+        if (!this->hashesValid) {
+            WiiUScreen::drawLine("Hashes of uncompressed wud: not available");
+        } else {
+            WiiUScreen::drawLinef("Hashes of uncompressed wud:");
+        }
+        for (const auto &[fst, snd] : this->hashesValid ? this->wudFileHashes.getHashes() : std::map<FileHashes::HashType, std::string>{}) {
             if (fst != FileHashes::HashType::SHA256) {
                 WiiUScreen::drawLinef("%s: \t %s", hashToStr(fst).c_str(), snd.c_str());
             } else {
@@ -452,6 +597,10 @@ std::string WUDDumperState::ErrorMessage() const {
             return "ERROR_WRITE_FAILED";
         case ERROR_NO_DISC_FOUND:
             return "ERROR_NO_DISC_FOUND";
+        case ERROR_NOT_ENOUGH_SPACE:
+            return "ERROR_NOT_ENOUGH_SPACE";
+        case ERROR_CACHE_WRITE_FAILED:
+            return "ERROR_CACHE_WRITE_FAILED";
     }
     return "UNKNOWN_ERROR";
 }
@@ -470,6 +619,10 @@ std::string WUDDumperState::ErrorDescription() const {
             return "Failed to write the file. \nMake sure to have enough space on the storage device.";
         case ERROR_NO_DISC_FOUND:
             return "Please insert a Wii U disc.";
+        case ERROR_NOT_ENOUGH_SPACE:
+            return "Not enough free space on the target device.";
+        case ERROR_CACHE_WRITE_FAILED:
+            return "Failed to save the resume cache to the target drive.";
     }
     return "UNKNOWN_ERROR";
 }
@@ -521,7 +674,14 @@ bool WUDDumperState::writeLogFile(const char *filepath, const WuddLog &log) {
     fprintf(file, "Disc ID: %s\n", log.disc.discIdOpt.value_or("-").c_str());
     fprintf(file, "Size of original WUD in bytes: %llu\n", static_cast<unsigned long long>(log.disc.sizeBytes));
 
+    if (!log.disc.runInfo.empty()) {
+        fprintf(file, "%s\n", log.disc.runInfo.c_str());
+    }
+
     fprintf(file, "Hashes of uncompressed WUD:\n");
+    if (log.disc.hashes.empty()) {
+        fprintf(file, log.disc.partial ? " Not available yet, the dump is not complete.\n" : " Not available.\n");
+    }
     for (const auto &[fst, snd] : log.disc.hashes) {
         fprintf(file, " %s: %s\n", hashToStr(fst).c_str(), snd.c_str());
     }
@@ -550,4 +710,82 @@ bool WUDDumperState::writeLogFile(const char *filepath, const WuddLog &log) {
 
     // Always close the file to flush the buffer and release the handle
     return fclose(file) == 0;
+}
+void WUDDumperState::queryFreeSpace() {
+    this->freeSpaceKnown = FSUtils::getFreeSpace(getPathForDevice(targetDevice).c_str(), this->freeBytesAtStart, this->deviceTotalBytes);
+    DEBUG_FUNCTION_LINE("Free space known: %d, free: %llu, total: %llu", this->freeSpaceKnown, this->freeBytesAtStart, this->deviceTotalBytes);
+}
+
+bool WUDDumperState::planRun(uint64_t startSector) {
+    this->runStartSector = startSector;
+    this->runEndSector   = this->totalSectorCount;
+    this->runIsPartial   = false;
+    this->runStartPart   = 1;
+    this->runNumber      = 1;
+    this->forceSplit     = targetDevice == TARGET_SD;
+    if (targetFormat != DUMP_AS_WUD) {
+        return true;
+    }
+    const uint64_t remainingBytes = (this->totalSectorCount - startSector) * SECTOR_SIZE;
+    if (this->freeSpaceKnown && remainingBytes + FREE_SPACE_MARGIN > this->freeBytesAtStart) {
+        const uint64_t usable  = this->freeBytesAtStart > FREE_SPACE_MARGIN ? this->freeBytesAtStart - FREE_SPACE_MARGIN : 0;
+        const uint64_t sectors = usable / SECTOR_SIZE;
+        if (sectors == 0) {
+            return false;
+        }
+        this->runEndSector = startSector + sectors;
+        this->runIsPartial = true;
+    }
+    // Multiple runs always use numbered parts, so all files can simply be put together (in order) later.
+    if (this->runIsPartial || startSector > 0) {
+        this->forceSplit = true;
+    }
+    return true;
+}
+
+void WUDDumperState::finishRun() {
+    if (!this->fileHandle->finalize()) {
+        DEBUG_FUNCTION_LINE_ERR("Final flush failed");
+        this->setError(ERROR_WRITE_FAILED);
+        return;
+    }
+    this->wudFileHashes.finalize();
+
+    if (this->runIsPartial) {
+        ResumeCache cache;
+        cache.targetFormat     = static_cast<uint32_t>(this->targetFormat);
+        cache.discId           = getPathNameForDisc();
+        cache.firstSectorHash  = this->firstSectorHash;
+        cache.totalSectorCount = this->totalSectorCount;
+        cache.nextSector       = this->currentSector;
+        cache.nextPart         = this->fileHandle->getNextPart();
+        cache.nextRun          = this->runNumber + 1;
+        cache.skippedSectors   = this->skippedSectors;
+        if (this->hashesValid) {
+            cache.hashState = this->wudFileHashes.exportState();
+        }
+        if (!FSUtils::CreateSubfolder((getPathForDevice(targetDevice) + RESUME_CACHE_SUBDIR).c_str()) || !cache.save(getResumeCachePath())) {
+            DEBUG_FUNCTION_LINE_ERR("Failed to save resume cache");
+            this->setError(ERROR_CACHE_WRITE_FAILED);
+            return;
+        }
+        this->resumeCacheSaved = true;
+    } else if (this->targetFormat == DUMP_AS_WUD) {
+        // The disc is complete, an old cache for it is not needed anymore.
+        remove(getResumeCachePath().c_str());
+    }
+    this->state = STATE_DUMP_DISC_DONE_SAVING_REPORT;
+}
+
+std::string WUDDumperState::getResumeCachePath() {
+    return string_format("%s%s/%s.bin", getPathForDevice(targetDevice).c_str(), RESUME_CACHE_SUBDIR, getPathNameForDisc().c_str());
+}
+
+uint64_t WUDDumperState::getRunBytes() const {
+    return (this->runEndSector - this->runStartSector) * SECTOR_SIZE;
+}
+
+uint64_t WUDDumperState::getLiveFreeBytes() const {
+    const uint64_t written = static_cast<uint64_t>(this->writtenSectors) * SECTOR_SIZE;
+    return this->freeBytesAtStart > written ? this->freeBytesAtStart - written : 0;
 }

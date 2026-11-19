@@ -3,6 +3,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 int32_t FSUtils::CheckFile(const char *filepath) {
@@ -84,4 +85,18 @@ int32_t FSUtils::saveBufferToFile(const char *path, void *buffer, uint32_t size)
     int32_t written = file.write((const uint8_t *) buffer, size);
     file.close();
     return written;
+}
+
+bool FSUtils::getFreeSpace(const char *path, uint64_t &freeBytes, uint64_t &totalBytes) {
+    freeBytes  = 0;
+    totalBytes = 0;
+    struct statvfs st {};
+    if (statvfs(path, &st) != 0) {
+        return false;
+    }
+    const uint64_t blockSize  = st.f_frsize != 0 ? st.f_frsize : st.f_bsize;
+    const uint64_t freeBlocks = st.f_bavail != 0 ? st.f_bavail : st.f_bfree;
+    freeBytes                 = freeBlocks * blockSize;
+    totalBytes                = static_cast<uint64_t>(st.f_blocks) * blockSize;
+    return totalBytes > 0;
 }

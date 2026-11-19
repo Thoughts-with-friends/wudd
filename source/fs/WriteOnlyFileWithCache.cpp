@@ -16,15 +16,19 @@
  ****************************************************************************/
 #include "WriteOnlyFileWithCache.h"
 #include <coreinit/memory.h>
+#include <cstdio>
 #include <malloc.h>
+#include <sys/stat.h>
 #include <utils/StringTools.h>
 #include <utils/logger.h>
 
 #define SPLIT_SIZE (0x80000000)
 
-WriteOnlyFileWithCache::WriteOnlyFileWithCache(const char *path, int32_t cacheSize, bool split) : CFile(split ? std::string(path) + ".part01" : path, WriteOnly),
-                                                                                                  splitFile(split),
-                                                                                                  originalPath(path) {
+WriteOnlyFileWithCache::WriteOnlyFileWithCache(const char *path, int32_t cacheSize, bool split, int32_t startPart) : CFile(split ? string_format("%s.part%02d", path, startPart) : std::string(path), WriteOnly),
+                                                                                                                     splitFile(split),
+                                                                                                                     part(startPart),
+                                                                                                                     firstPart(startPart),
+                                                                                                                     originalPath(path) {
     if (!this->isOpen()) {
         return;
     }
@@ -35,7 +39,7 @@ WriteOnlyFileWithCache::WriteOnlyFileWithCache(const char *path, int32_t cacheSi
         return;
     }
 
-    paths.insert(split ? std::string(path) + ".part01" : path);
+    paths.insert(split ? string_format("%s.part%02d", path, startPart) : std::string(path));
 
     this->writeBufferPos = 0;
 }
@@ -55,6 +59,20 @@ bool WriteOnlyFileWithCache::flush() {
         this->writeBufferPos = 0;
     }
     return true;
+}
+
+void WriteOnlyFileWithCache::removeEmptyTrailingPart() {
+    if (!splitFile || part <= firstPart || isOpen()) {
+        return;
+    }
+    const auto lastPath = string_format("%s.part%02d", originalPath.c_str(), part);
+    struct stat st {};
+    if (stat(lastPath.c_str(), &st) == 0 && st.st_size == 0) {
+        if (remove(lastPath.c_str()) == 0) {
+            paths.erase(lastPath);
+            part--;
+        }
+    }
 }
 
 std::set<std::string> WriteOnlyFileWithCache::getPathsInternal() const {

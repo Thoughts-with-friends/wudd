@@ -17,7 +17,7 @@
 #include "WUDFileWriter.h"
 #include <utils/logger.h>
 
-WUDFileWriter::WUDFileWriter(const char *path, int32_t cacheSize, int32_t pSectorSize, bool split) : WriteOnlyFileWithCache(path, cacheSize, split),
+WUDFileWriter::WUDFileWriter(const char *path, int32_t cacheSize, int32_t pSectorSize, bool split, int32_t startPart) : WriteOnlyFileWithCache(path, cacheSize, split, startPart),
                                                                                                      sectorSize(pSectorSize) {
 }
 
@@ -37,6 +37,7 @@ bool WUDFileWriter::finalize() {
         }
         this->close();
     }
+    removeEmptyTrailingPart();
 
     return true;
 }
@@ -44,6 +45,10 @@ bool WUDFileWriter::finalize() {
 
 std::set<std::string> WUDFileWriter::getPaths() const {
     return getPathsInternal();
+}
+
+int32_t WUDFileWriter::getNextPart() const {
+    return getNextPartNumber();
 }
 
 bool WUDFileWriter::isReady() const {

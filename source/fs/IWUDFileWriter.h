@@ -15,4 +15,9 @@ public:
     [[nodiscard]] virtual std::set<std::string> getPaths() const = 0;
 
     [[nodiscard]] virtual bool isReady() const = 0;
+
+    // Part number a continuation of this dump has to start with (only meaningful for split files).
+    [[nodiscard]] virtual int32_t getNextPart() const {
+        return 1;
+    }
 };

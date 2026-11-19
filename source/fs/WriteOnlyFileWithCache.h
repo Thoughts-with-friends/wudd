@@ -23,7 +23,7 @@
 
 class WriteOnlyFileWithCache : public CFile {
 public:
-    WriteOnlyFileWithCache(const char *string, int32_t cacheSize, bool split = false);
+    WriteOnlyFileWithCache(const char *string, int32_t cacheSize, bool split = false, int32_t startPart = 1);
 
     ~WriteOnlyFileWithCache() override;
 
@@ -39,12 +39,21 @@ public:
 
     bool flush();
 
+    // Removes a trailing empty part file (created when a write ended exactly on a split boundary).
+    void removeEmptyTrailingPart();
+
+    // Part number the next continuation of this file has to use.
+    [[nodiscard]] int32_t getNextPartNumber() const {
+        return part + 1;
+    }
+
     void *writeBuffer = nullptr;
     size_t writeBufferSize;
     size_t writeBufferPos;
 
     bool splitFile = false;
     int32_t part   = 1;
+    int32_t firstPart = 1;
     std::string originalPath;
     std::set<std::string> paths;
 

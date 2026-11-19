@@ -6,7 +6,7 @@
 #include "utils/WiiUScreen.h"
 #include "version.h"
 
-#define VERSION_STR "v1.2.3"
+#define VERSION_STR "v2.0.0"
 
 class ApplicationState {
 public:

@@ -18,6 +18,7 @@
 
 #include "ApplicationState.h"
 #include "common/common.h"
+#include "fs/ResumeCache.h"
 #include "fs/WUXFileWriter.h"
 #include "fs/WriteOnlyFileWithCache.h"
 #include "hash/FileHashes.h"
@@ -50,7 +51,10 @@ public:
         STATE_DUMP_PARTITION_CERT,
         STATE_DUMP_PARTITION_CONTENTS,
         STATE_DUMP_DONE,
-        STATE_ABORT_CONFIRMATION
+        STATE_ABORT_CONFIRMATION,
+        STATE_PLAN_DUMP,
+        STATE_ASK_USE_CACHE,
+        STATE_CONFIRM_PLAN,
     };
 
     enum eErrorState {
@@ -69,7 +73,9 @@ public:
         ERROR_FAILED_CREATE_FILE,
         ERROR_FAILED_WRITE_H3,
         ERROR_READ_CONTENT,
-        ERROR_WRITE_CONTENT
+        ERROR_WRITE_CONTENT,
+        ERROR_NOT_ENOUGH_SPACE,
+        ERROR_CACHE_WRITE_FAILED,
     };
 
     explicit GMPartitionsDumperState(eDumpTarget pTargetDevice);
@@ -105,7 +111,7 @@ public:
     std::unique_ptr<CFile> contentFile  = nullptr;
     std::shared_ptr<Content> curContent = nullptr;
     uint8_t *readBuffer                 = nullptr;
-    uint32_t curOffsetInContent         = 0;
+    uint64_t curOffsetInContent         = 0;
 
     [[nodiscard]] std::string ErrorMessage() const;
 
@@ -118,4 +124,31 @@ public:
     std::string getPathNameForDisc();
 
     OSTime dumpStartDate;
+
+    // --- free space / multi-run (resume cache) support ---
+    std::array<uint8_t, 32> firstSectorHash{};
+    bool freeSpaceKnown         = false;
+    uint64_t freeBytesAtStart   = 0;
+    uint64_t deviceTotalBytes   = 0;
+    uint64_t bytesWrittenThisRun = 0;
+
+    std::vector<uint64_t> contentSizes; // ROUNDUP(encryptedFileSize, 16), ordered by content index
+    uint64_t partitionTotalBytes = 0;
+
+    uint16_t runStartContentIndex = 0;
+    uint64_t runStartOffset       = 0;
+    uint16_t runEndContentIndex   = 0; // == contentSizes.size() if the run dumps until the end
+    uint64_t runEndOffset         = 0;
+    int32_t runStartPiece         = 1;
+    int32_t runNumber             = 1;
+    bool runIsPartial             = false; // this run stops before the end -> resume cache will be saved
+    int32_t curPieceNumber        = 0;     // 0 = plain .app, otherwise .app.partNN
+    std::string lastCutFileName;
+    std::optional<AppResumeCache> foundCache;
+
+    bool planRun(uint16_t startIndex, uint64_t startOffset);
+    [[nodiscard]] uint64_t positionOf(uint16_t index, uint64_t offset) const;
+    bool saveResumeCache();
+    [[nodiscard]] std::string getResumeCachePath();
+    [[nodiscard]] uint64_t getLiveFreeBytes() const;
 };

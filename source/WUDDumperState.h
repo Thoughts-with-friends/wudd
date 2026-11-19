@@ -17,6 +17,7 @@
 #pragma once
 
 #include "ApplicationState.h"
+#include "fs/ResumeCache.h"
 #include "fs/WUXFileWriter.h"
 #include "fs/WriteOnlyFileWithCache.h"
 #include "hash/FileHashes.h"
@@ -55,6 +56,9 @@ public:
         STATE_WAIT_USER_ERROR_CONFIRM,
         STATE_DUMP_DISC,
         STATE_ABORT_CONFIRMATION,
+        STATE_PLAN_DUMP,
+        STATE_ASK_USE_CACHE,
+        STATE_CONFIRM_PLAN,
     };
 
     enum eErrorState {
@@ -63,7 +67,9 @@ public:
         ERROR_FILE_OPEN_FAILED,
         ERROR_MALLOC_FAILED,
         ERROR_WRITE_FAILED,
-        ERROR_NO_DISC_FOUND
+        ERROR_NO_DISC_FOUND,
+        ERROR_NOT_ENOUGH_SPACE,
+        ERROR_CACHE_WRITE_FAILED,
     };
 
     struct DiscInfo {
@@ -72,6 +78,8 @@ public:
         uint64_t sizeBytes{};
         std::map<FileHashes::HashType, std::string> hashes;
         std::vector<uint64_t> skippedSectors;
+        std::string runInfo;
+        bool partial = false;
     };
     struct KeyInfo {
         std::string filepath;
@@ -117,6 +125,7 @@ public:
     int retryCount = 10;
 
     OSTime dumpStartTicks{};
+    OSTime runStartTicks{};
 
     std::unique_ptr<IWUDFileWriter> fileHandle = {};
 
@@ -145,4 +154,28 @@ public:
 
     std::string logFileName;
     bool logFileSaved = false;
+
+    // --- free space / multi-run (resume cache) support ---
+    std::array<uint8_t, 32> firstSectorHash{};
+    bool freeSpaceKnown      = false;
+    uint64_t freeBytesAtStart = 0;
+    uint64_t deviceTotalBytes = 0;
+
+    uint64_t runStartSector = 0;
+    uint64_t runEndSector   = 0;
+    int32_t runStartPart    = 1;
+    int32_t runNumber       = 1;
+    bool runIsPartial       = false; // this run stops before the end of the disc -> resume cache will be saved
+    bool forceSplit         = false;
+    bool hashesValid        = true;
+    bool resumeCacheSaved   = false;
+    std::optional<ResumeCache> foundCache;
+    bool useFoundCache = false;
+
+    void queryFreeSpace();
+    bool planRun(uint64_t startSector);
+    void finishRun();
+    [[nodiscard]] std::string getResumeCachePath();
+    [[nodiscard]] uint64_t getLiveFreeBytes() const;
+    [[nodiscard]] uint64_t getRunBytes() const;
 };

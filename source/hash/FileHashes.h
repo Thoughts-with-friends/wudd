@@ -11,6 +11,7 @@
 #include <optional>
 #include <queue>
 #include <thread>
+#include <vector>
 
 class FileHashes {
 public:
@@ -28,6 +29,11 @@ public:
     };
 
     std::map<HashType, std::string> getHashes();
+
+    // Serializes the intermediate digest state. Only valid after finalize() (worker joined).
+    [[nodiscard]] std::vector<uint8_t> exportState() const;
+    // Restores a state created by exportState(). Must be called right after reset(), before processHashes().
+    bool importState(const std::vector<uint8_t> &state);
 
 private:
     void hashWorker(const std::stop_token &stoken);

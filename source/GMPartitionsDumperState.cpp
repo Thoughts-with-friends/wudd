@@ -24,7 +24,9 @@
 #include <memory>
 #include <mocha/fsa.h>
 #include <mocha/mocha.h>
+#include <cstdio>
 #include <utils/StringTools.h>
+#include <utils/utils.h>
 
 #define READ_BUFFER_SIZE (SECTOR_SIZE * 128)
 
@@ -102,6 +104,46 @@ void GMPartitionsDumperState::render() {
             WiiUScreen::drawLine();
             WiiUScreen::drawLinef("%s Back", index == (uint32_t) selectedOptionY ? ">" : " ");
         }
+    } else if (this->state == STATE_PLAN_DUMP) {
+        WiiUScreen::drawLine("Checking free space...");
+    } else if (this->state == STATE_ASK_USE_CACHE) {
+        WiiUScreen::drawLinef("Partition %s", curPartition->getVolumeId().c_str());
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("A resume cache for this partition was found:");
+        WiiUScreen::drawLinef(" Run %d, continue at %.2f MiB / %.2f MiB", this->foundCache->nextRun,
+                              positionOf(this->foundCache->nextContentIndex, this->foundCache->nextOffset) / 1024.0f / 1024.0f,
+                              partitionTotalBytes / 1024.0f / 1024.0f);
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("Do you want to use the cache?");
+        WiiUScreen::drawLine();
+        if (selectedOptionX == 0) {
+            WiiUScreen::drawLine("> Yes (continue)     No (start from 0)");
+        } else {
+            WiiUScreen::drawLine("  Yes (continue)   > No (start from 0)");
+        }
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("Press B to return");
+    } else if (this->state == STATE_CONFIRM_PLAN) {
+        const uint64_t startPos = positionOf(runStartContentIndex, runStartOffset);
+        const uint64_t endPos   = positionOf(runEndContentIndex, runEndOffset);
+        WiiUScreen::drawLinef("Partition %s", curPartition->getVolumeId().c_str());
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLinef("Dump size:  %10.2f MiB", (endPos - startPos) / 1024.0f / 1024.0f);
+        if (freeSpaceKnown) {
+            WiiUScreen::drawLinef("Free space: %10.2f MiB (of %.2f MiB)", freeBytesAtStart / 1024.0f / 1024.0f, deviceTotalBytes / 1024.0f / 1024.0f);
+        } else {
+            WiiUScreen::drawLine("Free space: unknown");
+        }
+        WiiUScreen::drawLinef("Range: %.2f - %.2f MiB of %.2f MiB", startPos / 1024.0f / 1024.0f, endPos / 1024.0f / 1024.0f, partitionTotalBytes / 1024.0f / 1024.0f);
+        WiiUScreen::drawLine();
+        if (this->runIsPartial) {
+            WiiUScreen::drawLinef("Not enough space for the whole partition. This is run %d.", this->runNumber);
+            WiiUScreen::drawLine("A resume cache will be saved to the drive when it ends.");
+        } else if (startPos > 0) {
+            WiiUScreen::drawLinef("Run %d: this is the final run.", this->runNumber);
+        }
+        WiiUScreen::drawLine();
+        WiiUScreen::drawLine("Press A to start, B to return");
     } else if (this->state == STATE_CREATE_DATA_PROVIDER) {
         WiiUScreen::drawLine("Create data provider from partition");
     } else if (this->state == STATE_DUMP_PARTITION_TMD) {
@@ -151,11 +193,40 @@ void GMPartitionsDumperState::render() {
         } else {
             WiiUScreen::drawLine();
         }
+        if (freeSpaceKnown) {
+            WiiUScreen::drawLinef("%s: %.2f MiB free / %.2f MiB total", targetDevice == TARGET_NTFS ? "USB" : "SD",
+                                  getLiveFreeBytes() / 1024.0f / 1024.0f, deviceTotalBytes / 1024.0f / 1024.0f);
+        } else {
+            WiiUScreen::drawLinef("%s: free space unknown", targetDevice == TARGET_NTFS ? "USB" : "SD");
+        }
+        if (this->runIsPartial) {
+            WiiUScreen::drawLinef("Run %d stops at %.2f MiB -> resume cache will be saved", this->runNumber,
+                                  positionOf(runEndContentIndex, runEndOffset) / 1024.0f / 1024.0f);
+        } else if (runStartContentIndex > 0 || runStartOffset > 0) {
+            WiiUScreen::drawLinef("Run %d (resumed), final run", this->runNumber);
+        }
         WiiUScreen::drawLine();
         WiiUScreen::drawLine("Press X to abort the dumping");
 
     } else if (this->state == STATE_DUMP_DONE) {
-        WiiUScreen::drawLine("Dumping done. Press A to return.");
+        if (this->runIsPartial) {
+            WiiUScreen::drawLinef("Run %d done (%.2f MiB / %.2f MiB). Press A to return.", this->runNumber,
+                                  positionOf(runEndContentIndex, runEndOffset) / 1024.0f / 1024.0f, partitionTotalBytes / 1024.0f / 1024.0f);
+            WiiUScreen::drawLine();
+            WiiUScreen::drawLine("Resume cache saved: /" RESUME_CACHE_SUBDIR);
+            if (!this->lastCutFileName.empty()) {
+                WiiUScreen::drawLinef("Split file: %s", this->lastCutFileName.c_str());
+            }
+            WiiUScreen::drawLine("PC: move /wudump into a new folder per run (1, 2, ...).");
+            WiiUScreen::drawLine("Keep /dumpling on the USB, then dump the same partition again.");
+            WiiUScreen::drawLine("After the last run: start merge_wudd.bat on the PC.");
+        } else {
+            WiiUScreen::drawLine("Dumping done. Press A to return.");
+            if (this->runNumber > 1) {
+                WiiUScreen::drawLine();
+                WiiUScreen::drawLine("After the last run: start merge_wudd.bat on the PC.");
+            }
+        }
     } else if (this->state == STATE_ABORT_CONFIRMATION) {
         WiiUScreen::drawLinef("Do you really want to abort the disc dumping?");
         WiiUScreen::drawLinef("");
@@ -203,6 +274,7 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
         if (FSAEx_RawReadEx(gFSAClientHandle, this->sectorBuf, READ_SECTOR_SIZE, 1, 0, this->oddFd) >= 0) {
             this->discId[10] = '\0';
             memcpy(this->discId.data(), sectorBuf, 10);
+            calculateHash256(static_cast<unsigned char *>(this->sectorBuf), SECTOR_SIZE, this->firstSectorHash.data());
             this->state = STATE_READ_DISC_INFO_DONE;
             return ApplicationState::SUBSTATE_RUNNING;
         }
@@ -284,6 +356,70 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
                 return SUBSTATE_RUNNING;
             }
 
+            this->state = STATE_PLAN_DUMP;
+        }
+    } else if (this->state == STATE_PLAN_DUMP) {
+        this->contentSizes.clear();
+        this->partitionTotalBytes = 0;
+        for (size_t i = 0; i < curNUSTitle->tmd->contentList.size(); i++) {
+            auto contentOpt = curNUSTitle->tmd->getContentByIndex(i);
+            if (!contentOpt) {
+                this->setError(ERROR_FIND_CONTENT_BY_INDEX);
+                return SUBSTATE_RUNNING;
+            }
+            const uint64_t size = ROUNDUP(contentOpt.value()->encryptedFileSize, 16);
+            this->contentSizes.push_back(size);
+            this->partitionTotalBytes += size;
+        }
+
+        this->freeSpaceKnown = FSUtils::getFreeSpace(getPathForDevice(targetDevice).c_str(), this->freeBytesAtStart, this->deviceTotalBytes);
+
+        this->foundCache = AppResumeCache::load(getResumeCachePath());
+        if (this->foundCache) {
+            const auto &c = this->foundCache.value();
+            if (c.discId != getPathNameForDisc() || c.volumeId != curPartition->getVolumeId() || c.firstSectorHash != this->firstSectorHash ||
+                c.titleId != curNUSTitle->tmd->titleId || c.totalBytes != this->partitionTotalBytes ||
+                c.nextContentIndex >= this->contentSizes.size() || c.nextOffset >= this->contentSizes[c.nextContentIndex]) {
+                this->foundCache.reset();
+            }
+        }
+        if (this->foundCache) {
+            this->selectedOptionX = 0;
+            this->state           = STATE_ASK_USE_CACHE;
+            return SUBSTATE_RUNNING;
+        }
+        if (!planRun(0, 0)) {
+            this->setError(ERROR_NOT_ENOUGH_SPACE);
+            return SUBSTATE_RUNNING;
+        }
+        this->state = STATE_CONFIRM_PLAN;
+    } else if (this->state == STATE_ASK_USE_CACHE) {
+        if (buttonPressed(input, Input::BUTTON_B)) {
+            return SUBSTATE_RETURN;
+        }
+        proccessMenuNavigationX(input, 2);
+        if (entrySelected(input)) {
+            const bool useCache   = this->selectedOptionX == 0;
+            this->selectedOptionX = 0;
+            bool ok;
+            if (useCache) {
+                ok = planRun(this->foundCache->nextContentIndex, this->foundCache->nextOffset);
+                this->runStartPiece = this->foundCache->nextPiece;
+                this->runNumber     = this->foundCache->nextRun;
+            } else {
+                ok = planRun(0, 0);
+            }
+            if (!ok) {
+                this->setError(ERROR_NOT_ENOUGH_SPACE);
+                return SUBSTATE_RUNNING;
+            }
+            this->state = STATE_CONFIRM_PLAN;
+        }
+    } else if (this->state == STATE_CONFIRM_PLAN) {
+        if (buttonPressed(input, Input::BUTTON_B)) {
+            return SUBSTATE_RETURN;
+        }
+        if (entrySelected(input)) {
             this->state = STATE_DUMP_PARTITION_TMD;
         }
     } else if (this->state == STATE_DUMP_PARTITION_TMD) {
@@ -324,12 +460,27 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
             this->setError(ERROR_FAILED_WRITE_TICKET);
             return SUBSTATE_RUNNING;
         }
-        this->curContentIndex = 0;
-        this->state           = STATE_DUMP_PARTITION_CONTENTS;
+        this->curContentIndex     = this->runStartContentIndex;
+        this->curOffsetInContent  = this->runStartOffset;
+        this->bytesWrittenThisRun = 0;
+        this->state               = STATE_DUMP_PARTITION_CONTENTS;
     } else if (this->state == STATE_DUMP_PARTITION_CONTENTS) {
         if (buttonPressed(input, Input::BUTTON_X)) {
             this->state = STATE_ABORT_CONFIRMATION;
             return ApplicationState::SUBSTATE_RUNNING;
+        }
+        if (this->runIsPartial && curContentIndex == this->runEndContentIndex && curOffsetInContent >= this->runEndOffset) {
+            if (this->contentFile != nullptr) {
+                this->contentFile->close();
+                this->contentFile.reset();
+            }
+            this->curContent.reset();
+            if (!saveResumeCache()) {
+                this->setError(ERROR_CACHE_WRITE_FAILED);
+                return SUBSTATE_RUNNING;
+            }
+            this->state = STATE_DUMP_DONE;
+            return SUBSTATE_RUNNING;
         }
         // Get current content by index.
         if (curContent == nullptr) {
@@ -342,7 +493,7 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
         }
 
         // Check if we're done reading the file.
-        uint32_t size = ROUNDUP(curContent->encryptedFileSize, 16);
+        uint64_t size = ROUNDUP(curContent->encryptedFileSize, 16);
         if (curOffsetInContent >= size) {
             // Close current file
             this->contentFile->close();
@@ -357,6 +508,8 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
                 curContentIndex++;
                 return SUBSTATE_RUNNING;
             } else {
+                // Partition complete, a resume cache for it is not needed anymore.
+                remove(getResumeCachePath().c_str());
                 this->state = STATE_DUMP_DONE;
                 return SUBSTATE_RUNNING;
             }
@@ -365,7 +518,20 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
         // Open the file if needed
         if (this->contentFile == nullptr) {
             char bufApp[32];
-            snprintf(bufApp, 31, "%08X.app", curContent->ID);
+            if (curOffsetInContent > 0) {
+                // continuation of a content that was started in a previous run
+                this->curPieceNumber = this->runStartPiece;
+            } else if (this->runIsPartial && curContentIndex == this->runEndContentIndex && this->runEndOffset > 0) {
+                // this content will be cut at the end of this run
+                this->curPieceNumber = 1;
+            } else {
+                this->curPieceNumber = 0;
+            }
+            if (this->curPieceNumber > 0) {
+                snprintf(bufApp, 31, "%08X.app.part%02d", curContent->ID, this->curPieceNumber);
+            } else {
+                snprintf(bufApp, 31, "%08X.app", curContent->ID);
+            }
             std::string appFileName = targetPath + "/" + bufApp;
 
             this->contentFile = std::make_unique<CFile>(appFileName, CFile::WriteOnly);
@@ -375,9 +541,9 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
                 return SUBSTATE_RUNNING;
             }
 
-            // dump .h3 file as well
+            // dump .h3 file as well (only once per content)
             std::vector<uint8_t> h3Data;
-            if (dataProvider->getContentH3Hash(this->curContent, h3Data)) {
+            if (curOffsetInContent == 0 && dataProvider->getContentH3Hash(this->curContent, h3Data)) {
                 snprintf(bufApp, 31, "%08X.h3", curContent->ID);
                 std::string h3FileName = targetPath + "/" + bufApp;
                 if (FSUtils::saveBufferToFile(h3FileName.c_str(), h3Data.data(), h3Data.size()) != (int32_t) h3Data.size()) {
@@ -396,10 +562,11 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
             }
         }
 
-        uint32_t toRead = size - curOffsetInContent;
-        if (toRead > READ_BUFFER_SIZE) {
-            toRead = READ_BUFFER_SIZE;
+        uint64_t readEnd = size;
+        if (this->runIsPartial && curContentIndex == this->runEndContentIndex && this->runEndOffset < readEnd) {
+            readEnd = this->runEndOffset;
         }
+        uint32_t toRead = readEnd - curOffsetInContent > READ_BUFFER_SIZE ? READ_BUFFER_SIZE : (uint32_t) (readEnd - curOffsetInContent);
 
         if (!dataProvider->readRawContent(curContent, readBuffer, curOffsetInContent, toRead)) {
             this->setError(ERROR_READ_CONTENT);
@@ -411,6 +578,7 @@ ApplicationState::eSubState GMPartitionsDumperState::update(Input *input) {
             return SUBSTATE_RUNNING;
         }
         curOffsetInContent += toRead;
+        this->bytesWrittenThisRun += toRead;
 
         // Go on!
         this->state = STATE_DUMP_PARTITION_CONTENTS;
@@ -485,6 +653,10 @@ std::string GMPartitionsDumperState::ErrorMessage() const {
             return "ERROR_READ_CONTENT";
         case ERROR_WRITE_CONTENT:
             return "ERROR_WRITE_CONTENT";
+        case ERROR_NOT_ENOUGH_SPACE:
+            return "ERROR_NOT_ENOUGH_SPACE";
+        case ERROR_CACHE_WRITE_FAILED:
+            return "ERROR_CACHE_WRITE_FAILED";
     }
     return "UNKNOWN_ERROR";
 }
@@ -523,6 +695,10 @@ std::string GMPartitionsDumperState::ErrorDescription() const {
             return "Failed to read the a .app file from disc";
         case ERROR_WRITE_CONTENT:
             return "Failed to dump a .app. \nMake sure to have enough space on the storage device.";
+        case ERROR_NOT_ENOUGH_SPACE:
+            return "Not enough free space on the target device.";
+        case ERROR_CACHE_WRITE_FAILED:
+            return "Failed to save the resume cache to the target drive.";
     }
     return "UNKNOWN_ERROR";
 }
@@ -536,4 +712,81 @@ std::string GMPartitionsDumperState::getPathNameForDisc() {
                              tm.tm_hour, tm.tm_min, tm.tm_sec);
     }
     return std::string((char *) &discId[0]);
+}
+
+uint64_t GMPartitionsDumperState::positionOf(uint16_t index, uint64_t offset) const {
+    uint64_t pos = 0;
+    for (size_t i = 0; i < index && i < contentSizes.size(); i++) {
+        pos += contentSizes[i];
+    }
+    return pos + offset;
+}
+
+bool GMPartitionsDumperState::planRun(uint16_t startIndex, uint64_t startOffset) {
+    this->runStartContentIndex = startIndex;
+    this->runStartOffset       = startOffset;
+    this->runEndContentIndex   = (uint16_t) contentSizes.size();
+    this->runEndOffset         = 0;
+    this->runIsPartial         = false;
+    this->runStartPiece        = 1;
+    this->runNumber            = 1;
+    this->lastCutFileName.clear();
+
+    const uint64_t startPos = positionOf(startIndex, startOffset);
+    const uint64_t remaining = partitionTotalBytes - startPos;
+    if (!freeSpaceKnown || remaining + FREE_SPACE_MARGIN <= freeBytesAtStart) {
+        return true;
+    }
+    const uint64_t usable = freeBytesAtStart > FREE_SPACE_MARGIN ? freeBytesAtStart - FREE_SPACE_MARGIN : 0;
+    const uint64_t endPos = startPos + usable;
+
+    // Find the content that contains endPos and cut it at a multiple of the read size,
+    // so the next run reads exactly the same blocks a normal dump would.
+    uint64_t contentStart = 0;
+    for (size_t i = 0; i < contentSizes.size(); i++) {
+        if (endPos < contentStart + contentSizes[i]) {
+            uint64_t offset = endPos - contentStart;
+            offset -= offset % READ_BUFFER_SIZE;
+            if (i < startIndex || (i == startIndex && offset <= startOffset)) {
+                return false; // not even one block fits
+            }
+            this->runEndContentIndex = (uint16_t) i;
+            this->runEndOffset       = offset;
+            this->runIsPartial       = true;
+            return true;
+        }
+        contentStart += contentSizes[i];
+    }
+    return true;
+}
+
+bool GMPartitionsDumperState::saveResumeCache() {
+    AppResumeCache cache;
+    cache.discId           = getPathNameForDisc();
+    cache.volumeId         = curPartition->getVolumeId();
+    cache.firstSectorHash  = this->firstSectorHash;
+    cache.titleId          = curNUSTitle->tmd->titleId;
+    cache.totalBytes       = this->partitionTotalBytes;
+    cache.nextContentIndex = this->runEndContentIndex;
+    cache.nextOffset       = this->runEndOffset;
+    cache.nextPiece        = this->runEndOffset > 0 ? this->curPieceNumber + 1 : 1;
+    cache.nextRun          = this->runNumber + 1;
+    if (this->runEndOffset > 0) {
+        auto contentOpt = curNUSTitle->tmd->getContentByIndex(this->runEndContentIndex);
+        if (contentOpt) {
+            this->lastCutFileName = string_format("%08X.app.part%02d", contentOpt.value()->ID, this->curPieceNumber);
+        }
+    }
+    if (!FSUtils::CreateSubfolder((getPathForDevice(targetDevice) + RESUME_CACHE_SUBDIR).c_str())) {
+        return false;
+    }
+    return cache.save(getResumeCachePath());
+}
+
+std::string GMPartitionsDumperState::getResumeCachePath() {
+    return string_format("%s%s/%s_%s.app.bin", getPathForDevice(targetDevice).c_str(), RESUME_CACHE_SUBDIR, getPathNameForDisc().c_str(), curPartition->getVolumeId().c_str());
+}
+
+uint64_t GMPartitionsDumperState::getLiveFreeBytes() const {
+    return freeBytesAtStart > bytesWrittenThisRun ? freeBytesAtStart - bytesWrittenThisRun : 0;
 }
